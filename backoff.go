@@ -9,31 +9,35 @@ Simple example:
 	boff := backoff.New(
 		backoff.Exponential(),
 		backoff.MaxRetries(30),
-		backoff.FailCallback(func(err error, count uint) {
-			log.Println(count, err)
+		backoff.Notify(func(err error, next time.Duration, count uint) {
+			log.Println(count, next,  err)
 		}),
 	)
-	err := boff.Do(func() error {
+	err := boff.Do(ctx, func(ctx) error {
 		// if fail
 		return err
+		// if fail but not retry
+		return backoff.Continue(err)
 		// if ok
 		return nil
 	})
-
 */
 package backoff
 
 import (
+	"context"
 	"errors"
 	"math/rand"
 	"time"
+
+	"ciceroverneck.dev/backoff/internal"
 )
 
 const (
-	defaultMaxRetries          = 100
+	defaultMaxRetries          = 0
 	defaultInterval            = 500 * time.Millisecond
 	defaultMaxInterval         = 60 * time.Second
-	defaultMaxElapsedTime      = 15 * time.Minute
+	defaultMaxElapsedTime      = 0
 	defaultRandomizationFactor = 0.5
 	defaultMultiplier          = 1.5
 )
@@ -43,82 +47,37 @@ var (
 	ErrMaxElapsedTime = errors.New("")
 )
 
-type options struct {
-	maxRetries          uint
-	exponential         bool
-	failCallback        FailHandle
-	multiplier          float64
-	randomizationFactor float64
-	maxElapsedTime      time.Duration
-	interval            time.Duration
-	maxInterval         time.Duration
+
+type Handle func(ctx context.Context) error
+type NotifyHandle func(err error, duration time.Duration, count uint)
+
+func Continue(err error) error {
+	return &wrapContinueError{err: err}
 }
 
-type Option func(*options)
-
-type Handle func() error
-type FailHandle func(err error, count uint)
-
-func MaxRetries(v uint) Option {
-	return func(args *options) {
-		args.maxRetries = v
-	}
+type wrapContinueError struct {
+	err error
 }
 
-func Exponential() Option {
-	return func(args *options) {
-		args.exponential = true
-	}
+func (this *wrapContinueError) Error() string {
+	return this.err.Error()
 }
-
-func FailCallback(fn FailHandle) Option {
-	return func(args *options) {
-		args.failCallback = fn
-	}
-}
-
-func MaxElapsedTime(duration time.Duration) Option {
-	return func(args *options) {
-		args.maxElapsedTime = duration
-	}
-}
-
-func RandomizationFactor(randomizationFactor float64) Option {
-	return func(args *options) {
-		args.randomizationFactor = randomizationFactor
-	}
-}
-
-func Multiplier(multiplier float64) Option {
-	return func(args *options) {
-		args.multiplier = multiplier
-	}
-}
-
-func MaxInterval(duration time.Duration) Option {
-	return func(args *options) {
-		args.maxInterval = duration
-	}
-}
-
-func Interval(duration time.Duration) Option {
-	return func(args *options) {
-		args.interval = duration
-	}
+func (this *wrapContinueError) Unwrap() error {
+	return this.err
 }
 
 type Backoff struct {
-	opts *options
+	opts *internal.BackoffSettings
 }
 
 func New(opt ...Option) *Backoff {
-	args := &options{
-		maxRetries:          defaultMaxRetries,
-		maxElapsedTime:      defaultMaxElapsedTime,
-		multiplier:          defaultMultiplier,
-		interval:            defaultInterval,
-		maxInterval:         defaultMaxInterval,
-		randomizationFactor: defaultRandomizationFactor,
+	args := &internal.BackoffSettings{
+		MaxRetries:          defaultMaxRetries,
+		MaxElapsedTime:      defaultMaxElapsedTime,
+		Multiplier:          defaultMultiplier,
+		Interval:            defaultInterval,
+		MaxInterval:         defaultMaxInterval,
+		RandomizationFactor: defaultRandomizationFactor,
 	}
 	for _, setter := range opt {
 		setter(args)
@@ -128,38 +87,52 @@ func New(opt ...Option) *Backoff {
 	}
 }
 
-func (b *Backoff) Do(fn Handle) error {
-	start := time.Now()
-	currentInterval := b.opts.interval
+func (this *Backoff) Do(ctx context.Context, fn Handle) error {
+	var start = time.Now()
+	var currentInterval = this.opts.Interval
 	var count uint
+	var err error
+	var errs []error
+
 	for {
-		if err := fn(); err != nil {
-			if b.opts.failCallback != nil {
-				b.opts.failCallback(err, count)
-			}
-			if count > b.opts.maxRetries {
-				return ErrMaxRetries
-			}
-			if b.opts.maxElapsedTime != 0 && time.Now().Sub(start) > b.opts.maxElapsedTime {
-				return ErrMaxElapsedTime
-			}
-			count++
-			if float64(currentInterval) >= float64(b.opts.maxInterval)/b.opts.multiplier {
-				currentInterval = b.opts.maxInterval
-			} else {
-				if b.opts.exponential {
-					currentInterval = time.Duration(float64(currentInterval) * b.opts.multiplier)
-				}
-			}
-
-			currentInterval = getRandomValueFromInterval(b.opts.randomizationFactor, currentInterval)
-
-			time.Sleep(currentInterval)
-		} else {
+		if err = fn(ctx); err == nil {
 			return nil
+		}
+		var errContinue *wrapContinueError
+		if errors.As(err, &errContinue) {
+			return errContinue.err
+		}
+
+		count++
+		if this.opts.MaxRetries != 0 && count >= this.opts.MaxRetries {
+			return ErrMaxRetries
+		}
+		if this.opts.MaxElapsedTime != 0 && time.Now().Sub(start) > this.opts.MaxElapsedTime {
+			return ErrMaxElapsedTime
+		}
+
+		if float64(currentInterval) >= float64(this.opts.MaxInterval)/this.opts.Multiplier {
+			currentInterval = this.opts.MaxInterval
+		} else {
+			if this.opts.Exponential {
+				currentInterval = time.Duration(float64(currentInterval) * this.opts.Multiplier)
+			}
+		}
+		currentInterval = getRandomValueFromInterval(this.opts.RandomizationFactor, currentInterval)
+
+		if this.opts.Notify != nil {
+			this.opts.Notify(err, currentInterval, count)
+		}
+		errs = append(errs, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(currentInterval):
 		}
 	}
 }
+
 func getRandomValueFromInterval(randomizationFactor float64, currentInterval time.Duration) time.Duration {
 	delta := randomizationFactor * float64(currentInterval)
 	minInterval := float64(currentInterval) - delta
